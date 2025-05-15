@@ -1,0 +1,6 @@
+streamlit>=1.20.0
+pandas
+numpy
+plotly
+pyomo
+fpdf2        # only if you’re using the PDF‐export feature
