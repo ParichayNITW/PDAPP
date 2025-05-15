@@ -354,13 +354,27 @@ def solve_pipeline(FLOW, KV, rho, SFC_J, SFC_R, SFC_S, RateDRA, Price_HSD):
 
 
 
-     # --------------------
-    # SOLVE using Bonmin locally
-    opts = {'tol':1e-3, 'acceptable_tol':1e-3, 'max_cpu_time':3000, 'max_iter':100000}
-    solver = SolverFactory('bonmin')
-    if not solver.available():
-        raise RuntimeError("Bonmin solver is not available. Please install Couenne or configure NEOS solver plugin.")
+# --------------------
+# SOLVE (strictly MINLP)
+# --------------------
+opts = {
+    'tol':            1e-3,
+    'acceptable_tol': 1e-3,
+    'max_cpu_time':   300,     # CPU‐seconds cap
+    'max_iter':       100000
+}
+
+solver = SolverFactory('bonmin')
+if solver.available():
+    # local Bonmin
     results = solver.solve(model, tee=True, options=opts)
+else:
+    # remote NEOS
+    neos = SolverManagerFactory('neos')
+    try:
+        results = neos.solve(model, opt='bonmin', tee=True)
+    except Exception:
+        results = neos.solve(model, opt='couenne', tee=True)
 
 
 
