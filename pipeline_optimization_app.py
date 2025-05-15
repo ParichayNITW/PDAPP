@@ -6,9 +6,21 @@ import plotly.express as px
 import plotly.graph_objects as go
 from pipeline_model import solve_pipeline
 
-# ---------------------
-# Page configuration
-# ---------------------
+    # --------------------
+    # SOLVE using Bonmin locally (fallback to NEOS remote MINLP solvers)
+    opts = {'tol':1e-3, 'acceptable_tol':1e-3, 'max_cpu_time':3000, 'max_iter':100000}
+    solver = SolverFactory('bonmin')
+    if solver.available():
+        results = solver.solve(model, tee=True, options=opts)
+    else:
+        # Remote NEOS: try Bonmin, then Couenne
+        manager = SolverManagerFactory('neos')
+        try:
+            results = manager.solve(model, opt='bonmin', tee=True)
+        except Exception:
+            results = manager.solve(model, opt='couenne', tee=True)
+
+    # ---------------------
 st.set_page_config(
     page_title="Pipeline Optimization Dashboard",
     layout="wide"
@@ -74,8 +86,8 @@ if run:
     c3.metric("Avg Speed (rpm)", f"{avg_speed:.1f}")
     c4.metric("Avg Efficiency (%)", f"{avg_eff:.1f}")
 
-    # Main Tabs
-    tab1,tab2,tab3,tab4,tab5 = st.tabs(["📋 Summary Table","💰 Cost Charts","⚙️ Performance Charts","🌀 System Curves","🔄 Pump-System Interaction"])
+    # Tabs
+    tab1,tab2,tab3 = st.tabs(["📋 Summary Table","💰 Cost Charts","⚙️ Performance Charts"])
 
     # Summary Table
     with tab1:
@@ -112,146 +124,35 @@ if run:
             "Power & Fuel (INR/day)": [res.get(f"power_cost_{s.lower()}",0) for s in stations],
             "DRA (INR/day)":         [res.get(f"dra_cost_{s.lower()}",0)   for s in stations]
         })
-        fig_cost = px.bar(
-            cost_df.melt(id_vars="Station", value_vars=["Power & Fuel (INR/day)","DRA (INR/day)"],
-                         var_name="Cost Type", value_name="Amount"),
-            x="Station", y="Amount", color="Cost Type", barmode="group", height=450,
-            title="Cost Components by Station"
-        )
-        st.plotly_chart(fig_cost, use_container_width=True)
+        fig = px.bar(cost_df.melt(id_vars="Station", value_vars=["Power & Fuel (INR/day)","DRA (INR/day)"], var_name="Type", value_name="Amount"),
+                     x="Station", y="Amount", color="Type", barmode="group", title="Cost Components by Station")
+        fig.update_layout(xaxis_title="Station", yaxis_title="Amount (INR)")
+        st.plotly_chart(fig, use_container_width=True)
 
     # Performance Charts
     with tab3:
-        perf_tab1, perf_tab2 = st.tabs(["Performance Metrics","Pump Characteristic Curves"])
+        st.markdown("<div class='section-title'>Performance Metrics</div>", unsafe_allow_html=True)
+        perf_df = pd.DataFrame({
+            "Station":stations,
+            "Head Loss (m)":   [res.get(f"head_loss_{s.lower()}",0) for s in stations]
+        })
+        fig = go.Figure(go.Bar(x=perf_df["Station"], y=perf_df["Head Loss (m)"], name="Head Loss (m)"))
+        fig.update_layout(xaxis_title="Station", yaxis_title="Head Loss (m)")
+        st.plotly_chart(fig, use_container_width=True)
 
-        # Perf Metrics
-        with perf_tab1:
-            st.markdown("<div class='section-title'>Performance Metrics</div>", unsafe_allow_html=True)
-            perf_df = pd.DataFrame({
-                "Station":stations,
-                "Head Loss (m)":   [res.get(f"head_loss_{s.lower()}",0) for s in stations]
-            })
-            fig_perf = go.Figure()
-            fig_perf.add_trace(go.Bar(
-                x=perf_df["Station"],
-                y=perf_df["Head Loss (m)"],
-                name="Head Loss (m)"
-            ))
-            fig_perf.update_layout(
-                xaxis_title="Station",
-                yaxis_title="Head Loss (m)",
-                height=500
-            )
-            st.plotly_chart(fig_perf, use_container_width=True)
-
-        # Pump Curves
-        with perf_tab2:
-            st.markdown("<div class='section-title'>Pump Characteristic Curves</div>", unsafe_allow_html=True)
-            sel = st.multiselect("Select stations", stations, default=stations)
-            flow_range = np.arange(0, 4500+1, 100)
-
-            # Q-H curves
-            st.subheader("Flow vs TDHA (Head) by RPM")
-            for stn in sel:
-                k = stn.lower()
-                A,B,C = res.get(f"coef_A_{k}"), res.get(f"coef_B_{k}"), res.get(f"coef_C_{k}")
-                DOL,Min = res.get(f"dol_{k}"), res.get(f"min_rpm_{k}")
-                if None in [A,B,C,DOL,Min]: 
-                    st.warning(f"Missing pump curve params for {stn}")
-                    continue
-                dfh = pd.DataFrame()
-                for rpm in np.arange(Min, DOL+1, 100):
-                    H = (A*flow_range**2 + B*flow_range + C)*(rpm/DOL)**2
-                    dfh = pd.concat([dfh, pd.DataFrame({"Flow (m³/hr)": flow_range, "Head (m)": H, "RPM": rpm})])
-                fig_h = px.line(
-                    dfh, x="Flow (m³/hr)", y="Head (m)", color="RPM", markers=True,
-                    title=f"Flow vs Head Curves ({stn})"
-                )
-                st.plotly_chart(fig_h, use_container_width=True)
-
-            # Q-Eff curves
-            st.subheader("Flow vs Efficiency by RPM")
-            for stn in sel:
-                k = stn.lower()
-                P,Q,R,S,T = [res.get(f"coef_{x}_{k}") for x in ['P','Q','R','S','T']]
-                DOL,Min = res.get(f"dol_{k}"), res.get(f"min_rpm_{k}")
-                if None in [P,Q,R,S,T,DOL,Min]:
-                    st.warning(f"Missing efficiency curve params for {stn}")
-                    continue
-                dfe = pd.DataFrame()
-                for rpm in np.arange(Min, DOL+1, 100):
-                    eqQ = flow_range * DOL / rpm
-                    E = (P*eqQ**4 + Q*eqQ**3 + R*eqQ**2 + S*eqQ + T) / 100
-                    dfe = pd.concat([dfe, pd.DataFrame({"Flow (m³/hr)": flow_range, "Efficiency (%)": E, "RPM": rpm})])
-                fig_e = px.line(
-                    dfe, x="Flow (m³/hr)", y="Efficiency (%)", color="RPM", markers=True,
-                    title=f"Flow vs Efficiency Curves ({stn})"
-                )
-                st.plotly_chart(fig_e, use_container_width=True)
-
-        # System Curves of SDHR
-    with tab4:
-        st.markdown("<div class='section-title'>System Curves of SDHR</div>", unsafe_allow_html=True)
-        all_stations = ["Vadinar","Jamnagar","Rajkot","Chotila","Surendranagar"]
-        params = {
-            "Vadinar": {"d":0.697, "L":46.7, "e":0.00004},
-            "Jamnagar": {"d":0.697, "L":67.9, "e":0.00004},
-            "Rajkot": {"d":0.697, "L":40.2, "e":0.00004},
-            "Chotila": {"d":0.697, "L":60.0, "e":0.00004},
-            "Surendranagar": {"d":0.697, "L":60.0, "e":0.00004}
-        }
-        static_heads = {
-            "Vadinar": 24-8,
-            "Jamnagar": 113-24,
-            "Rajkot": 232-113,
-            "Chotila": 80-232,
-            "Surendranagar": 23-80
-        }
-        flow_range = np.arange(0,4501,100)
-        for stn in all_stations:
-            p = params[stn]
-            sd0 = static_heads[stn]
-            df_sys = pd.DataFrame()
-            for dra in range(0,41,5):
-                v = flow_range/(3.414*p["d"]**2/4)/3600
-                Re = v*p["d"]/(KV*1e-6)
-                f = 0.25/(np.log10((p["e"]/p["d"]/3.7)+(5.74/(Re**0.9)))**2)
-                DH = (f*(p["L"]*1000/p["d"])*(v**2/(2*9.81)))*(1 - dra/100)
-                SDHR = sd0 + DH
-                df2 = pd.DataFrame({"Flow (m³/hr)": flow_range, "SDHR (m)": SDHR, "DRA (%)": dra})
-                df_sys = pd.concat([df_sys, df2], ignore_index=True)
-            fig_sys = px.line(df_sys, x="Flow (m³/hr)", y="SDHR (m)", color="DRA (%)",
-                              title=f"System Curve: SDHR vs Flow ({stn})")
-            st.plotly_chart(fig_sys, use_container_width=True)
-
-    # Pump-System Interaction
-    with tab5:
-        st.markdown("<div class='section-title'>Pump-System Interaction</div>", unsafe_allow_html=True)
-        pump_stations = ["Vadinar","Jamnagar","Rajkot","Surendranagar"]
-        flow_range = np.arange(0,4501,100)
-        for stn in pump_stations:
-            k = stn.lower()
-            # system curves at 0 and 40%
-            p = params[stn]
-            sd0 = static_heads[stn]
-            df_sys2 = pd.DataFrame()
-            for dra in [0,40]:
-                v = flow_range/(3.414*p["d"]**2/4)/3600
-                Re = v*p["d"]/(KV*1e-6)
-                f = 0.25/(np.log10((p["e"]/p["d"]/3.7)+(5.74/(Re**0.9)))**2)
-                DH = (f*(p["L"]*1000/p["d"])*(v**2/(2*9.81)))*(1 - dra/100)
-                SDHR = sd0 + DH
-                df_sys2 = pd.concat([df_sys2, pd.DataFrame({"Flow (m³/hr)": flow_range, "Head (m)": SDHR, "Curve": f"System, DRA={dra}%"})], ignore_index=True)
-            # pump curves
-            df_pump = pd.DataFrame()
-            for rpm in np.arange(res.get(f"min_rpm_{k}"), res.get(f"dol_{k}")+1, 100):
-                A,B,C = res.get(f"coef_A_{k}"), res.get(f"coef_B_{k}"), res.get(f"coef_C_{k}")
-                H = (A*flow_range**2 + B*flow_range + C)*(rpm/res.get(f"dol_{k}"))**2
-                df_pump = pd.concat([df_pump, pd.DataFrame({"Flow (m³/hr)": flow_range, "Head (m)": H, "Curve": f"Pump, {rpm} rpm"})], ignore_index=True)
-            df_all = pd.concat([df_sys2, df_pump], ignore_index=True)
-            fig_int = px.line(df_all, x="Flow (m³/hr)", y="Head (m)", color="Curve",
-                              title=f"Pump-System Interaction ({stn})")
-            st.plotly_chart(fig_int, use_container_width=True)
+        st.markdown("<div class='section-title'>Pump Characteristic Curves</div>", unsafe_allow_html=True)
+        sel = st.multiselect("Select stations", stations, default=stations)
+        fr = np.arange(0,4501,100)
+        for stn in sel:
+            k=stn.lower(); A,B,C=res.get(f"coef_A_{k}"),res.get(f"coef_B_{k}"),res.get(f"coef_C_{k}")
+            D,Min=res.get(f"dol_{k}"),res.get(f"min_rpm_{k}")
+            if None in [A,B,C,D,Min]: continue
+            dfh=pd.DataFrame();
+            for rpm in np.arange(Min,D+1,100):
+                dfh=pd.concat([dfh,pd.DataFrame({"Flow (m³/hr)":fr,"Head (m)":(A*fr**2+B*fr+C)*(rpm/D)**2})])
+            figh=px.line(dfh,x="Flow (m³/hr)",y="Head (m)")
+            figh.update_traces(mode="lines"); figh.update_layout(xaxis_title="Flow (m³/hr)", yaxis_title="Head (m)")
+            st.plotly_chart(figh, use_container_width=True)
 
     st.markdown("---")
     st.caption("© 2025 Developed by Parichay Das")
